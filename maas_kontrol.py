@@ -7,10 +7,16 @@ ekler. Yorumlar karışık sırayla gelir; hepsi bitmeden aynısı tekrar etmez.
 
 Gizli ayarlar (GitHub > Settings > Secrets and variables > Actions):
   BOT_TOKEN  - BotFather'dan alınan token
-  CHAT_ID    - Telegram sohbet numaranız (bot ilk çalışmada size söyler)
+  CHAT_ID    - Telegram sohbet numaranız (bot ilk çalışmada size söyler).
+               Birden fazla kişi için virgülle ayırın: 8943985917,1234567890
   MAAS_RUB   - Maaş (ruble), örn. 144000
+  DAVET_KODU - (isteğe bağlı) Girilirse sadece davet linkiyle gelenler katılabilir:
+               https://t.me/BOT_ADI?start=DAVET_KODU
 
-Not: durum.json dosyasına maaş tutarı değil, sadece kur yazılır.
+Abonelik: Bota /start yazan herkes otomatik eklenir, /stop yazan çıkar.
+Sahibine (CHAT_ID) her yeni abone bildirilir.
+
+Not: durum.json dosyasına maaş tutarı değil, kur ve abonelerin sohbet numaraları yazılır.
 """
 
 import json
@@ -27,6 +33,7 @@ TR = timezone(timedelta(hours=3))
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 MAAS_RUB = os.environ.get("MAAS_RUB", "").strip()
+DAVET_KODU = os.environ.get("DAVET_KODU", "").strip()
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -170,14 +177,87 @@ def kur_al():
 
 
 def mesaj_gonder(chat_id, metin):
-    r = requests.post(
-        f"{API}/sendMessage",
-        data={"chat_id": chat_id, "text": metin},
-        timeout=20,
-    )
-    if not r.ok:
-        print(f"Telegram hatası: {r.status_code} {r.text}")
-        sys.exit(1)
+    """Mesajı gönderir. chat_id tek numara, virgüllü metin veya liste olabilir.
+    Biri başarısız olursa (ör. botu engellediyse) diğerlerine yine gönderilir.
+    Dönüş: (başarılı sayısı, botu engelleyenlerin listesi)"""
+    if isinstance(chat_id, (list, tuple)):
+        kisiler = [str(c).strip() for c in chat_id if str(c).strip()]
+    else:
+        kisiler = [c.strip() for c in str(chat_id).split(",") if c.strip()]
+    basarili, engelleyenler = 0, []
+    for kisi in kisiler:
+        try:
+            r = requests.post(
+                f"{API}/sendMessage",
+                data={"chat_id": kisi, "text": metin},
+                timeout=20,
+            )
+            if r.ok:
+                basarili += 1
+            else:
+                print(f"Telegram hatası ({kisi}): {r.status_code} {r.text}")
+                if r.status_code in (400, 403):
+                    engelleyenler.append(kisi)
+        except Exception as e:
+            print(f"Telegram hatası ({kisi}): {e}")
+    return basarili, engelleyenler
+
+
+def sahipler():
+    return [c.strip() for c in CHAT_ID.split(",") if c.strip()]
+
+
+def isim(kimden):
+    ad = " ".join(x for x in [kimden.get("first_name"), kimden.get("last_name")] if x)
+    if kimden.get("username"):
+        ad += f" (@{kimden['username']})"
+    return ad or "Biri"
+
+
+def abone_isle(durum):
+    """Bota yazılan yeni mesajları okur: /start yazanı ekler, /stop yazanı çıkarır."""
+    try:
+        r = requests.get(
+            f"{API}/getUpdates",
+            params={"offset": durum.get("update_offset", 0), "timeout": 0},
+            timeout=20,
+        )
+        guncellemeler = r.json().get("result", [])
+    except Exception as e:
+        print(f"Abone kontrol hatası: {e}")
+        return
+
+    aboneler = durum.setdefault("aboneler", [])
+    for g in guncellemeler:
+        durum["update_offset"] = g["update_id"] + 1
+        mesaj = g.get("message") or {}
+        sohbet = mesaj.get("chat", {})
+        if sohbet.get("type") != "private":
+            continue
+        kid = str(sohbet.get("id", ""))
+        metin = (mesaj.get("text") or "").strip()
+        komut = metin.split()[0].split("@")[0].lower() if metin else ""
+        if not kid or kid in sahipler():
+            continue
+
+        if komut == "/start":
+            parcalar = metin.split(maxsplit=1)
+            kod = parcalar[1].strip() if len(parcalar) > 1 else ""
+            if DAVET_KODU and kod != DAVET_KODU:
+                mesaj_gonder(kid, "🔒 Bu bot özel. Katılmak için davet linki gerekiyor.")
+                continue
+            if kid not in aboneler:
+                aboneler.append(kid)
+                mesaj_gonder(
+                    kid,
+                    "✅ Hoş geldin! Artık 10 dakikada bir maaş mesajı gelecek.\n"
+                    "Ayrılmak istersen /stop yaz.",
+                )
+                mesaj_gonder(sahipler(), f"👤 Yeni abone: {isim(mesaj.get('from', {}))}")
+        elif komut == "/stop" and kid in aboneler:
+            aboneler.remove(kid)
+            mesaj_gonder(kid, "👋 Abonelik bitti. Tekrar gelmek istersen /start yaz.")
+            mesaj_gonder(sahipler(), f"🚪 Ayrıldı: {isim(mesaj.get('from', {}))}")
 
 
 def chat_id_bul():
@@ -268,10 +348,22 @@ def main():
 
     satirlar.append(f"🕒 {zaman:%H:%M} • 1 RUB = {kur:.4f} TL")
 
-    mesaj_gonder(CHAT_ID, "\n".join(satirlar))
+    abone_isle(durum)
+    aboneler = durum.get("aboneler", [])
+    alicilar = sahipler() + [a for a in aboneler if a not in sahipler()]
+    basarili, engelleyenler = mesaj_gonder(alicilar, "\n".join(satirlar))
+
+    # Botu engelleyen aboneleri listeden çıkar
+    for kisi in engelleyenler:
+        if kisi in aboneler:
+            aboneler.remove(kisi)
+
     durum["onceki_kur"] = kur
     kaydet(durum)
+    if basarili == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
