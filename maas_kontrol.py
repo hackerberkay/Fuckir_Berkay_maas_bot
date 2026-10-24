@@ -1,9 +1,10 @@
 """
 Ruble Maaş Takip — GitHub Actions sürümü
 ----------------------------------------
-GitHub her ~10 dakikada bir bu dosyayı çalıştırır ve maaşın TL karşılığını
-Telegram'a yazar. Bir önceki mesaja göre arttıysa iyi, düştüyse kötü bir yorum
-ekler. Yorumlar karışık sırayla gelir; hepsi bitmeden aynısı tekrar etmez.
+GitHub her ~10 dakikada bir bu dosyayı çalıştırıp kuru kontrol eder.
+Maaşın TL karşılığı son mesaja göre ESIK_TL (300 TL) kadar artınca veya düşünce
+Telegram'a yazar: artışta iyi, düşüşte kötü bir yorum ekler.
+Yorumlar karışık sırayla gelir; hepsi bitmeden aynısı tekrar etmez.
 
 Gizli ayarlar (GitHub > Settings > Secrets and variables > Actions):
   BOT_TOKEN  - BotFather'dan alınan token
@@ -22,11 +23,13 @@ Not: durum.json dosyasına maaş tutarı değil, kur ve abonelerin sohbet numara
 import json
 import os
 import random
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
 import requests
 
+ESIK_TL = 300  # Maaş kaç TL değişince mesaj gelsin
 DOSYA = "durum.json"
 TR = timezone(timedelta(hours=3))
 
@@ -155,20 +158,45 @@ def binlik(x):
     return f"{round(x):,}".replace(",", ".")
 
 
-def kur_al():
-    """1 RUB kaç TL? Önce Yahoo (anlık), olmazsa ExchangeRate-API (günlük)."""
-    try:
-        r = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/RUBTRY=X",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=20,
-        )
-        fiyat = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if fiyat and float(fiyat) > 0:
-            return float(fiyat)
-    except Exception as e:
-        print(f"Yahoo hatası: {e}")
+def google_kur():
+    """Google Finance RUB-TRY sayfasındaki en son veri noktasını okur."""
+    r = requests.get(
+        "https://www.google.com/finance/quote/RUB-TRY",
+        params={"hl": "en"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        cookies={"CONSENT": "YES+"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    # Grafik verisi: [[yıl,ay,gün,saat,dakika,null,null,[...]],[fiyat,...]]
+    noktalar = re.findall(
+        r"\[\[(\d{4}),(\d{1,2}),(\d{1,2}),(\d{1,2}|null),(\d{1,2}|null),null,null,"
+        r"\[[^\]]*\]\],\[([0-9.Ee-]+),",
+        r.text,
+    )
+    if not noktalar:
+        raise ValueError("Google sayfasında kur bulunamadı")
+    sayi = lambda v: int(v) if v != "null" else 0
+    en_son = max(noktalar, key=lambda p: tuple(sayi(x) for x in p[:5]))
+    return float(en_son[5])
 
+
+def kur_al():
+    """1 RUB kaç TL? Önce Google Finance (anlık), olmazsa ExchangeRate-API (günlük)."""
+    try:
+        fiyat = google_kur()
+        if 0.01 < fiyat < 100:
+            print("Kaynak: Google Finance")
+            return fiyat
+        print(f"Google'dan anormal kur geldi: {fiyat}")
+    except Exception as e:
+        print(f"Google hatası: {e}")
+
+    print("Kaynak: ExchangeRate-API (yedek, günlük)")
     r = requests.get("https://open.er-api.com/v6/latest/RUB", timeout=20)
     fiyat = float(r.json()["rates"]["TRY"])
     if fiyat <= 0:
@@ -214,7 +242,7 @@ def isim(kimden):
     return ad or "Biri"
 
 
-def abone_isle(durum):
+def abone_isle(durum, deger):
     """Bota yazılan yeni mesajları okur: /start yazanı ekler, /stop yazanı çıkarır."""
     try:
         r = requests.get(
@@ -250,7 +278,9 @@ def abone_isle(durum):
                 aboneler.append(kid)
                 mesaj_gonder(
                     kid,
-                    "✅ Hoş geldin! Artık 10 dakikada bir maaş mesajı gelecek.\n"
+                    "✅ Hoş geldin!\n"
+                    f"💰 Maaş şu an: {binlik(deger)} TL\n"
+                    f"{ESIK_TL} TL artınca veya düşünce haber vereceğim.\n"
                     "Ayrılmak istersen /stop yaz.",
                 )
                 mesaj_gonder(sahipler(), f"👤 Yeni abone: {isim(mesaj.get('from', {}))}")
@@ -330,35 +360,52 @@ def main():
     zaman = simdi()
     print(f"{zaman:%d.%m.%Y %H:%M} | 1 RUB = {kur:.5f} TL")
 
-    satirlar = [f"💰 Maaşın: {binlik(deger)} TL"]
+    # Eski sürümden geçiş: önceki kur varsa referans olarak kullan
+    if "referans_kur" not in durum and durum.get("onceki_kur"):
+        durum["referans_kur"] = durum.pop("onceki_kur")
+    durum.pop("onceki_kur", None)
 
-    onceki_kur = durum.get("onceki_kur")
-    if onceki_kur:
-        fark = round(deger - maas * onceki_kur)
-        if fark >= 1:
-            satirlar.append(f"📈 +{binlik(fark)} TL arttı")
-            satirlar.append(f"💬 {yorum_sec(durum, 'iyi', IYI_YORUMLAR)}")
-        elif fark <= -1:
-            satirlar.append(f"📉 -{binlik(abs(fark))} TL düştü")
-            satirlar.append(f"💬 {yorum_sec(durum, 'kotu', KOTU_YORUMLAR)}")
-        else:
-            satirlar.append("➖ Değişmedi")
+    abone_isle(durum, deger)
+
+    satirlar = None
+    ref_kur = durum.get("referans_kur")
+    if not ref_kur:
+        satirlar = [
+            f"💰 Maaşın: {binlik(deger)} TL",
+            f"✅ Takip başladı. Maaş {ESIK_TL} TL değişince yazacağım.",
+        ]
     else:
-        satirlar.append("✅ Takip başladı, 10 dakikada bir yazacağım.")
+        fark = deger - maas * ref_kur
+        if fark >= ESIK_TL:
+            satirlar = [
+                f"💰 Maaşın: {binlik(deger)} TL",
+                f"📈 +{binlik(fark)} TL arttı",
+                f"💬 {yorum_sec(durum, 'iyi', IYI_YORUMLAR)}",
+            ]
+        elif fark <= -ESIK_TL:
+            satirlar = [
+                f"💰 Maaşın: {binlik(deger)} TL",
+                f"📉 -{binlik(abs(fark))} TL düştü",
+                f"💬 {yorum_sec(durum, 'kotu', KOTU_YORUMLAR)}",
+            ]
+        else:
+            print(f"Değişim {round(fark)} TL, eşik {ESIK_TL} TL — mesaj yok.")
 
-    satirlar.append(f"🕒 {zaman:%H:%M} • 1 RUB = {kur:.4f} TL")
+    basarili = None
+    if satirlar:
+        satirlar.append(f"🕒 {zaman:%H:%M} • 1 RUB = {kur:.4f} TL")
+        aboneler = durum.get("aboneler", [])
+        alicilar = sahipler() + [a for a in aboneler if a not in sahipler()]
+        basarili, engelleyenler = mesaj_gonder(alicilar, "\n".join(satirlar))
+        # Botu engelleyen aboneleri listeden çıkar
+        for kisi in engelleyenler:
+            if kisi in aboneler:
+                aboneler.remove(kisi)
+        if basarili:
+            durum["referans_kur"] = kur
 
-    abone_isle(durum)
-    aboneler = durum.get("aboneler", [])
-    alicilar = sahipler() + [a for a in aboneler if a not in sahipler()]
-    basarili, engelleyenler = mesaj_gonder(alicilar, "\n".join(satirlar))
-
-    # Botu engelleyen aboneleri listeden çıkar
-    for kisi in engelleyenler:
-        if kisi in aboneler:
-            aboneler.remove(kisi)
-
-    durum["onceki_kur"] = kur
+    # Günde bir kayıt: GitHub'ın zamanlanmış görevi kapatmaması için
+    durum["son_gun"] = f"{zaman:%Y-%m-%d}"
     kaydet(durum)
     if basarili == 0:
         sys.exit(1)
@@ -366,4 +413,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
