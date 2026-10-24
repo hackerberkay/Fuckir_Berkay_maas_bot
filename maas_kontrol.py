@@ -1,25 +1,33 @@
 """
-Ruble Maaş Takip — GitHub Actions sürümü
-----------------------------------------
-GitHub her ~10 dakikada bir bu dosyayı çalıştırıp kuru kontrol eder.
-Maaşın TL karşılığı son mesaja göre ESIK_TL (300 TL) kadar artınca veya düşünce
-Telegram'a yazar: artışta iyi, düşüşte kötü bir yorum ekler.
-Yorumlar karışık sırayla gelir; hepsi bitmeden aynısı tekrar etmez.
+Ruble Maaş Takip Botu — GitHub Actions sürümü
+---------------------------------------------
+GitHub her ~5 dakikada bir bu dosyayı çalıştırır:
+  1) Google Finance'ten RUB/TRY kurunu alır.
+  2) Bota yazılan yeni mesajları okur (kayıt, maaş, eşik soruları).
+  3) Her kişiye kendi maaşı ve eşiğine göre bildirim gönderir.
+
+Kayıt akışı (arkadaşlar için):
+  /start  -> "Maaşın kaç ruble?"  -> 144000
+          -> "Kaç TL değişince haber vereyim?" -> 300
+Komutlar: /durum  /maas  /esik  /stop  /yardim
+
+Maaş her 5.000 TL sınırını (80, 85, 90, 95 bin...) yukarı geçtiğinde
+mesaja "Berkay'a da bir şeyler ısmarlarsın artık" notu eklenir.
 
 Gizli ayarlar (GitHub > Settings > Secrets and variables > Actions):
   BOT_TOKEN  - BotFather'dan alınan token
-  CHAT_ID    - Telegram sohbet numaranız (bot ilk çalışmada size söyler).
-               Birden fazla kişi için virgülle ayırın: 8943985917,1234567890
-  MAAS_RUB   - Maaş (ruble), örn. 144000
+  CHAT_ID    - Botun sahibinin sohbet numarası (Berkay)
+  MAAS_RUB   - Sahibin maaşı (ruble), örn. 144000
   DAVET_KODU - (isteğe bağlı) Girilirse sadece davet linkiyle gelenler katılabilir:
                https://t.me/BOT_ADI?start=DAVET_KODU
 
-Abonelik: Bota /start yazan herkes otomatik eklenir, /stop yazan çıkar.
-Sahibine (CHAT_ID) her yeni abone bildirilir.
-
-Not: durum.json dosyasına maaş tutarı değil, kur ve abonelerin sohbet numaraları yazılır.
+Gizlilik: Herkesin maaşı ve sohbet numarası veri.enc dosyasında ŞİFRELİ durur.
+Şifre anahtarı BOT_TOKEN'dan üretilir; depo herkese açık olsa da okunamaz.
+(BOT_TOKEN değişirse kayıtlar okunamaz, herkes /start ile yeniden kaydolur.)
 """
 
+import base64
+import hashlib
 import json
 import os
 import random
@@ -28,9 +36,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 
-ESIK_TL = 300  # Maaş kaç TL değişince mesaj gelsin
-DOSYA = "durum.json"
+SAHIP_ADI = "Berkay"
+VARSAYILAN_ESIK = 300   # Sahip için varsayılan eşik (TL)
+BAND = 5000             # 80-85-90-95 bin gibi sınırlar
+VERI_DOSYASI = "veri.enc"
+ESKI_DOSYA = "durum.json"
 TR = timezone(timedelta(hours=3))
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -149,6 +161,8 @@ KOTU_YORUMLAR = [
 ]
 
 
+# ───────────────────────── yardımcılar ─────────────────────────
+
 def simdi():
     return datetime.now(TR)
 
@@ -157,6 +171,32 @@ def binlik(x):
     """61920.4 -> '61.920'"""
     return f"{round(x):,}".replace(",", ".")
 
+
+def sayi_oku(metin):
+    """'144.000', '144 000', '144000 rub', '144k' -> 144000. Anlaşılmazsa None."""
+    t = metin.lower().replace(" ", "").replace(".", "").replace(",", "")
+    carpan = 1
+    if t.endswith("k") or t.endswith("bin"):
+        carpan = 1000
+        t = t[:-1] if t.endswith("k") else t[:-3]
+    rakamlar = re.sub(r"[^0-9]", "", t)
+    if not rakamlar or not re.fullmatch(r"[0-9]+(rub|ruble|tl|₽)?", t):
+        return None
+    return int(rakamlar) * carpan
+
+
+def sahipler():
+    return [c.strip() for c in CHAT_ID.split(",") if c.strip()]
+
+
+def isim(kimden):
+    ad = " ".join(x for x in [kimden.get("first_name"), kimden.get("last_name")] if x)
+    if kimden.get("username"):
+        ad += f" (@{kimden['username']})"
+    return ad or "Biri"
+
+
+# ───────────────────────── kur ─────────────────────────
 
 def google_kur():
     """Google Finance RUB-TRY sayfasındaki en son veri noktasını okur."""
@@ -180,8 +220,8 @@ def google_kur():
     )
     if not noktalar:
         raise ValueError("Google sayfasında kur bulunamadı")
-    sayi = lambda v: int(v) if v != "null" else 0
-    en_son = max(noktalar, key=lambda p: tuple(sayi(x) for x in p[:5]))
+    s = lambda v: int(v) if v != "null" else 0
+    en_son = max(noktalar, key=lambda p: tuple(s(x) for x in p[:5]))
     return float(en_son[5])
 
 
@@ -204,9 +244,10 @@ def kur_al():
     return fiyat
 
 
+# ───────────────────────── telegram ─────────────────────────
+
 def mesaj_gonder(chat_id, metin):
-    """Mesajı gönderir. chat_id tek numara, virgüllü metin veya liste olabilir.
-    Biri başarısız olursa (ör. botu engellediyse) diğerlerine yine gönderilir.
+    """Mesaj gönderir. chat_id tek numara, virgüllü metin veya liste olabilir.
     Dönüş: (başarılı sayısı, botu engelleyenlerin listesi)"""
     if isinstance(chat_id, (list, tuple)):
         kisiler = [str(c).strip() for c in chat_id if str(c).strip()]
@@ -223,71 +264,12 @@ def mesaj_gonder(chat_id, metin):
             if r.ok:
                 basarili += 1
             else:
-                print(f"Telegram hatası ({kisi}): {r.status_code} {r.text}")
+                print(f"Telegram hatası: {r.status_code} {r.text}")
                 if r.status_code in (400, 403):
                     engelleyenler.append(kisi)
         except Exception as e:
-            print(f"Telegram hatası ({kisi}): {e}")
+            print(f"Telegram hatası: {e}")
     return basarili, engelleyenler
-
-
-def sahipler():
-    return [c.strip() for c in CHAT_ID.split(",") if c.strip()]
-
-
-def isim(kimden):
-    ad = " ".join(x for x in [kimden.get("first_name"), kimden.get("last_name")] if x)
-    if kimden.get("username"):
-        ad += f" (@{kimden['username']})"
-    return ad or "Biri"
-
-
-def abone_isle(durum, deger):
-    """Bota yazılan yeni mesajları okur: /start yazanı ekler, /stop yazanı çıkarır."""
-    try:
-        r = requests.get(
-            f"{API}/getUpdates",
-            params={"offset": durum.get("update_offset", 0), "timeout": 0},
-            timeout=20,
-        )
-        guncellemeler = r.json().get("result", [])
-    except Exception as e:
-        print(f"Abone kontrol hatası: {e}")
-        return
-
-    aboneler = durum.setdefault("aboneler", [])
-    for g in guncellemeler:
-        durum["update_offset"] = g["update_id"] + 1
-        mesaj = g.get("message") or {}
-        sohbet = mesaj.get("chat", {})
-        if sohbet.get("type") != "private":
-            continue
-        kid = str(sohbet.get("id", ""))
-        metin = (mesaj.get("text") or "").strip()
-        komut = metin.split()[0].split("@")[0].lower() if metin else ""
-        if not kid or kid in sahipler():
-            continue
-
-        if komut == "/start":
-            parcalar = metin.split(maxsplit=1)
-            kod = parcalar[1].strip() if len(parcalar) > 1 else ""
-            if DAVET_KODU and kod != DAVET_KODU:
-                mesaj_gonder(kid, "🔒 Bu bot özel. Katılmak için davet linki gerekiyor.")
-                continue
-            if kid not in aboneler:
-                aboneler.append(kid)
-                mesaj_gonder(
-                    kid,
-                    "✅ Hoş geldin!\n"
-                    f"💰 Maaş şu an: {binlik(deger)} TL\n"
-                    f"{ESIK_TL} TL artınca veya düşünce haber vereceğim.\n"
-                    "Ayrılmak istersen /stop yaz.",
-                )
-                mesaj_gonder(sahipler(), f"👤 Yeni abone: {isim(mesaj.get('from', {}))}")
-        elif komut == "/stop" and kid in aboneler:
-            aboneler.remove(kid)
-            mesaj_gonder(kid, "👋 Abonelik bitti. Tekrar gelmek istersen /start yaz.")
-            mesaj_gonder(sahipler(), f"🚪 Ayrıldı: {isim(mesaj.get('from', {}))}")
 
 
 def chat_id_bul():
@@ -306,40 +288,281 @@ def chat_id_bul():
         cid,
         "👋 Bot sizi buldu!\n\n"
         f"Sohbet numaranız (CHAT_ID): {cid}\n\n"
-        "Bu numarayı GitHub'da CHAT_ID adlı secret olarak ekleyin. "
-        "Sonra mesajlar otomatik başlayacak.",
+        "Bu numarayı GitHub'da CHAT_ID adlı secret olarak ekleyin.",
     )
-    print(f"CHAT_ID bulundu ve Telegram'a gönderildi: {cid}")
+    print("CHAT_ID bulundu ve Telegram'a gönderildi.")
 
 
-def yorum_sec(durum, tur, liste):
-    """Desteden karışık sırayla yorum çeker; deste bitince yeniden karıştırır."""
-    anahtar = f"{tur}_deste"
-    deste = [i for i in durum.get(anahtar, []) if 0 <= i < len(liste)]
-    if not deste:
-        deste = list(range(len(liste)))
-        random.shuffle(deste)
-        son = durum.get(f"{tur}_son")
-        if son is not None and len(deste) > 1 and deste[0] == son:
-            deste.append(deste.pop(0))  # art arda aynısı gelmesin
-    secilen = deste.pop(0)
-    durum[anahtar] = deste
-    durum[f"{tur}_son"] = secilen
-    return liste[secilen]
+# ───────────────────────── veri (şifreli) ─────────────────────────
+
+def _fernet():
+    anahtar = hashlib.sha256(f"maas-bot:{BOT_TOKEN}".encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(anahtar))
 
 
 def yukle():
-    if os.path.exists(DOSYA):
-        with open(DOSYA, "r", encoding="utf-8") as f:
+    if os.path.exists(VERI_DOSYASI):
+        try:
+            with open(VERI_DOSYASI, "rb") as f:
+                return json.loads(_fernet().decrypt(f.read().strip()))
+        except InvalidToken:
+            print("UYARI: veri.enc okunamadı (BOT_TOKEN değişmiş olabilir). Sıfırdan başlanıyor.")
+            return {"_sifirlandi": True}
+    if os.path.exists(ESKI_DOSYA):
+        with open(ESKI_DOSYA, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def kaydet(durum):
-    with open(DOSYA, "w", encoding="utf-8") as f:
-        json.dump(durum, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+def kaydet(veri):
+    with open(VERI_DOSYASI, "wb") as f:
+        f.write(_fernet().encrypt(json.dumps(veri, ensure_ascii=False).encode()) + b"\n")
+    if os.path.exists(ESKI_DOSYA):
+        os.remove(ESKI_DOSYA)  # şifresiz eski dosyayı kaldır
 
+
+def gecis(veri):
+    """Eski sürümün durum.json yapısını yeni yapıya çevirir."""
+    kullanicilar = veri.setdefault("kullanicilar", {})
+    for kisi in veri.pop("aboneler", []):
+        kullanicilar.setdefault(str(kisi), {"maas": None, "esik": None, "adim": "maas",
+                                            "ref_kur": None, "band": None, "sor": True})
+    ref = veri.pop("referans_kur", None) or veri.pop("onceki_kur", None)
+    veri.pop("onceki_kur", None)
+    if ref:
+        for s in sahipler():
+            kullanicilar.setdefault(s, {}).setdefault("ref_kur", ref)
+
+
+def sahip_kaydi(veri, s):
+    """Sahibin kaydı yoksa MAAS_RUB ve varsayılan eşikle oluşturur."""
+    k = veri["kullanicilar"].setdefault(s, {})
+    if not k.get("maas"):
+        try:
+            k["maas"] = int(float(MAAS_RUB))
+        except ValueError:
+            k["maas"] = None
+            k["adim"] = "maas"
+            k["sor"] = True
+    k.setdefault("esik", VARSAYILAN_ESIK)
+    k.setdefault("adim", None)
+    k.setdefault("ref_kur", None)
+    k.setdefault("band", None)
+    return k
+
+
+# ───────────────────────── yorumlar ─────────────────────────
+
+def yorum_sec(veri, tur, liste):
+    """Desteden karışık sırayla yorum çeker; deste bitince yeniden karıştırır."""
+    anahtar = f"{tur}_deste"
+    deste = [i for i in veri.get(anahtar, []) if 0 <= i < len(liste)]
+    if not deste:
+        deste = list(range(len(liste)))
+        random.shuffle(deste)
+        son = veri.get(f"{tur}_son")
+        if son is not None and len(deste) > 1 and deste[0] == son:
+            deste.append(deste.pop(0))  # art arda aynısı gelmesin
+    secilen = deste.pop(0)
+    veri[anahtar] = deste
+    veri[f"{tur}_son"] = secilen
+    return liste[secilen]
+
+
+# ───────────────────────── sohbet ─────────────────────────
+
+SORU_MAAS = "💬 Maaşın kaç ruble? Sadece rakam yaz.\nÖrnek: 144000"
+SORU_ESIK = ("💬 Maaşın kaç TL artınca veya düşünce haber vereyim?\n"
+             "Örnek: 300")
+YARDIM = ("📋 Komutlar:\n"
+          "/durum – maaşın şu an kaç TL\n"
+          "/maas – maaşını değiştir\n"
+          "/esik – kaç TL'de haber vereyim, değiştir\n"
+          "/stop – bildirimleri kapat")
+
+
+def ayar_tamam(k):
+    return bool(k.get("maas")) and bool(k.get("esik")) and not k.get("adim")
+
+
+def durum_metni(k, kur):
+    deger = k["maas"] * kur
+    return (f"💰 Maaşın şu an: {binlik(deger)} TL\n"
+            f"• Maaş: {binlik(k['maas'])} RUB\n"
+            f"• Bildirim eşiği: {binlik(k['esik'])} TL\n"
+            f"• Kur: 1 RUB = {kur:.4f} TL")
+
+
+def kurulumu_bitir(k, kur):
+    deger = k["maas"] * kur
+    k["ref_kur"] = kur
+    k["band"] = int(deger // BAND)
+    return ("✅ Tamamdır!\n"
+            f"💰 Maaşın şu an: {binlik(deger)} TL\n"
+            f"{binlik(k['esik'])} TL artınca veya düşünce haber vereceğim.\n\n" + YARDIM)
+
+
+def mesajlari_isle(veri, kur):
+    """Bota yazılan yeni mesajları okur ve cevaplar."""
+    try:
+        r = requests.get(
+            f"{API}/getUpdates",
+            params={"offset": veri.get("update_offset", 0), "timeout": 0},
+            timeout=20,
+        )
+        guncellemeler = r.json().get("result", [])
+    except Exception as e:
+        print(f"Mesaj okuma hatası: {e}")
+        return
+
+    kullanicilar = veri["kullanicilar"]
+    for g in guncellemeler:
+        veri["update_offset"] = g["update_id"] + 1
+        mesaj = g.get("message") or {}
+        sohbet = mesaj.get("chat", {})
+        if sohbet.get("type") != "private":
+            continue
+        kid = str(sohbet.get("id", ""))
+        metin = (mesaj.get("text") or "").strip()
+        if not kid or not metin:
+            continue
+        komut = metin.split()[0].split("@")[0].lower() if metin.startswith("/") else ""
+        sahip = kid in sahipler()
+        k = kullanicilar.get(kid)
+
+        # Kayıtlı olmayan biri
+        if k is None:
+            if komut != "/start":
+                mesaj_gonder(kid, "👋 Başlamak için /start yaz.")
+                continue
+            parcalar = metin.split(maxsplit=1)
+            kod = parcalar[1].strip() if len(parcalar) > 1 else ""
+            if DAVET_KODU and kod != DAVET_KODU:
+                mesaj_gonder(kid, "🔒 Bu bot özel. Katılmak için davet linki gerekiyor.")
+                continue
+            kullanicilar[kid] = {"maas": None, "esik": None, "adim": "maas",
+                                 "ref_kur": None, "band": None}
+            mesaj_gonder(kid, "👋 Hoş geldin! Birkaç soru soracağım.\n\n" + SORU_MAAS)
+            mesaj_gonder(sahipler(), f"👤 Yeni abone: {isim(mesaj.get('from', {}))}")
+            continue
+
+        # Komutlar
+        if komut == "/start":
+            if ayar_tamam(k):
+                mesaj_gonder(kid, "Zaten kayıtlısın 👍\n\n" + durum_metni(k, kur) + "\n\n" + YARDIM)
+            else:
+                k["adim"] = "maas" if not k.get("maas") else "esik"
+                mesaj_gonder(kid, SORU_MAAS if k["adim"] == "maas" else SORU_ESIK)
+        elif komut == "/stop":
+            if sahip:
+                mesaj_gonder(kid, "Sen botun sahibisin 😎 Durdurmak için GitHub'da "
+                                  "Actions → Maas Takip → Disable workflow.")
+            else:
+                del kullanicilar[kid]
+                mesaj_gonder(kid, "👋 Bildirimler kapandı. Tekrar gelmek istersen /start yaz.")
+                mesaj_gonder(sahipler(), f"🚪 Ayrıldı: {isim(mesaj.get('from', {}))}")
+        elif komut == "/maas":
+            k["adim"] = "maas"
+            mesaj_gonder(kid, SORU_MAAS)
+        elif komut == "/esik":
+            k["adim"] = "esik"
+            mesaj_gonder(kid, SORU_ESIK)
+        elif komut == "/durum":
+            if k.get("maas") and k.get("esik"):
+                mesaj_gonder(kid, durum_metni(k, kur))
+            else:
+                mesaj_gonder(kid, "Önce soruları cevaplaman lazım.\n\n"
+                                  + (SORU_MAAS if not k.get("maas") else SORU_ESIK))
+        elif komut:
+            mesaj_gonder(kid, YARDIM)
+
+        # Soru cevapları
+        elif k.get("adim") == "maas":
+            maas = sayi_oku(metin)
+            if not maas or not (1_000 <= maas <= 100_000_000):
+                mesaj_gonder(kid, "🤔 Anlamadım. Maaşını sadece rakamla yaz.\nÖrnek: 144000")
+                continue
+            k["maas"] = maas
+            k["ref_kur"] = None
+            if k.get("esik"):
+                k["adim"] = None
+                mesaj_gonder(kid, kurulumu_bitir(k, kur))
+            else:
+                k["adim"] = "esik"
+                mesaj_gonder(kid, f"👍 {binlik(maas)} RUB, şu an {binlik(maas * kur)} TL ediyor.\n\n"
+                                  + SORU_ESIK)
+        elif k.get("adim") == "esik":
+            esik = sayi_oku(metin)
+            if not esik or not (10 <= esik <= 10_000_000):
+                mesaj_gonder(kid, "🤔 Anlamadım. Sadece rakam yaz.\nÖrnek: 300")
+                continue
+            k["esik"] = esik
+            k["adim"] = None
+            mesaj_gonder(kid, kurulumu_bitir(k, kur))
+        else:
+            mesaj_gonder(kid, YARDIM)
+
+
+def ismarla_notu(sahip):
+    if sahip:
+        return "Kendine bir şeyler ısmarla artık 😎"
+    return f"Ekstra {SAHIP_ADI}'a da bir şeyler ısmarlarsın artık 😏"
+
+
+def bildirimleri_gonder(veri, kur, zaman):
+    """Her kişiye kendi maaşı ve eşiğine göre bildirim gönderir."""
+    kullanicilar = veri["kullanicilar"]
+    toplam_deneme = toplam_basarili = 0
+    for kid in list(kullanicilar):
+        k = kullanicilar[kid]
+        if not ayar_tamam(k):
+            continue
+        sahip = kid in sahipler()
+        deger = k["maas"] * kur
+        su_anki_band = int(deger // BAND)
+
+        if not k.get("ref_kur"):
+            k["ref_kur"] = kur
+            k["band"] = su_anki_band
+            continue
+        if k.get("band") is None:
+            k["band"] = su_anki_band
+
+        fark = deger - k["maas"] * k["ref_kur"]
+        esik_gecti = abs(fark) >= k["esik"]
+        band_gecti = su_anki_band > k["band"]
+        if not band_gecti and deger < k["band"] * BAND - 1000:
+            k["band"] = su_anki_band  # belirgin düştü: sınırı aşağı çek
+
+        if not (esik_gecti or band_gecti):
+            continue
+
+        satirlar = [f"💰 Maaşın: {binlik(deger)} TL"]
+        if esik_gecti and fark > 0:
+            satirlar += [f"📈 +{binlik(fark)} TL arttı",
+                         f"💬 {yorum_sec(veri, 'iyi', IYI_YORUMLAR)}"]
+        elif esik_gecti:
+            satirlar += [f"📉 -{binlik(abs(fark))} TL düştü",
+                         f"💬 {yorum_sec(veri, 'kotu', KOTU_YORUMLAR)}"]
+        if band_gecti:
+            satirlar.append(f"🎉 {su_anki_band * BAND // 1000} bin TL'yi geçti! {ismarla_notu(sahip)}")
+        satirlar.append(f"🕒 {zaman:%H:%M} • 1 RUB = {kur:.4f} TL")
+
+        toplam_deneme += 1
+        basarili, engelleyenler = mesaj_gonder(kid, "\n".join(satirlar))
+        toplam_basarili += basarili
+        if basarili:
+            if esik_gecti:
+                k["ref_kur"] = kur
+            if band_gecti:
+                k["band"] = su_anki_band
+        elif engelleyenler and not sahip:
+            del kullanicilar[kid]  # botu engellemiş
+            print("Botu engelleyen bir abone silindi.")
+    return toplam_deneme, toplam_basarili
+
+
+# ───────────────────────── ana akış ─────────────────────────
 
 def main():
     if not BOT_TOKEN:
@@ -348,66 +571,35 @@ def main():
     if not CHAT_ID:
         chat_id_bul()
         return
-    try:
-        maas = float(MAAS_RUB)
-    except ValueError:
-        print("MAAS_RUB secret'ı eksik veya hatalı (örnek: 144000).")
-        sys.exit(1)
 
-    durum = yukle()
+    veri = yukle()
+    once = json.dumps(veri, sort_keys=True, ensure_ascii=False)
+    sifirlandi = veri.pop("_sifirlandi", False)
+    gecis(veri)
+    for s in sahipler():
+        sahip_kaydi(veri, s)
+
     kur = kur_al()
-    deger = maas * kur
     zaman = simdi()
     print(f"{zaman:%d.%m.%Y %H:%M} | 1 RUB = {kur:.5f} TL")
 
-    # Eski sürümden geçiş: önceki kur varsa referans olarak kullan
-    if "referans_kur" not in durum and durum.get("onceki_kur"):
-        durum["referans_kur"] = durum.pop("onceki_kur")
-    durum.pop("onceki_kur", None)
+    if sifirlandi:
+        mesaj_gonder(sahipler(), "⚠️ Kayıtlar okunamadı (BOT_TOKEN değişmiş olabilir). "
+                                 "Arkadaşların /start ile yeniden kaydolmalı.")
 
-    abone_isle(durum, deger)
+    # Eski sürümden gelen abonelere maaş sorusunu sor
+    for kid, k in veri["kullanicilar"].items():
+        if k.pop("sor", False):
+            mesaj_gonder(kid, "🆕 Bot güncellendi! Artık herkes kendi maaşını girebiliyor.\n\n"
+                              + SORU_MAAS)
 
-    satirlar = None
-    ref_kur = durum.get("referans_kur")
-    if not ref_kur:
-        satirlar = [
-            f"💰 Maaşın: {binlik(deger)} TL",
-            f"✅ Takip başladı. Maaş {ESIK_TL} TL değişince yazacağım.",
-        ]
-    else:
-        fark = deger - maas * ref_kur
-        if fark >= ESIK_TL:
-            satirlar = [
-                f"💰 Maaşın: {binlik(deger)} TL",
-                f"📈 +{binlik(fark)} TL arttı",
-                f"💬 {yorum_sec(durum, 'iyi', IYI_YORUMLAR)}",
-            ]
-        elif fark <= -ESIK_TL:
-            satirlar = [
-                f"💰 Maaşın: {binlik(deger)} TL",
-                f"📉 -{binlik(abs(fark))} TL düştü",
-                f"💬 {yorum_sec(durum, 'kotu', KOTU_YORUMLAR)}",
-            ]
-        else:
-            print(f"Değişim {round(fark)} TL, eşik {ESIK_TL} TL — mesaj yok.")
+    mesajlari_isle(veri, kur)
+    deneme, basarili = bildirimleri_gonder(veri, kur, zaman)
 
-    basarili = None
-    if satirlar:
-        satirlar.append(f"🕒 {zaman:%H:%M} • 1 RUB = {kur:.4f} TL")
-        aboneler = durum.get("aboneler", [])
-        alicilar = sahipler() + [a for a in aboneler if a not in sahipler()]
-        basarili, engelleyenler = mesaj_gonder(alicilar, "\n".join(satirlar))
-        # Botu engelleyen aboneleri listeden çıkar
-        for kisi in engelleyenler:
-            if kisi in aboneler:
-                aboneler.remove(kisi)
-        if basarili:
-            durum["referans_kur"] = kur
-
-    # Günde bir kayıt: GitHub'ın zamanlanmış görevi kapatmaması için
-    durum["son_gun"] = f"{zaman:%Y-%m-%d}"
-    kaydet(durum)
-    if basarili == 0:
+    veri["son_gun"] = f"{zaman:%Y-%m-%d}"  # GitHub görevi kapatmasın diye günlük kayıt
+    if json.dumps(veri, sort_keys=True, ensure_ascii=False) != once or os.path.exists(ESKI_DOSYA):
+        kaydet(veri)
+    if deneme and not basarili:
         sys.exit(1)
 
 
